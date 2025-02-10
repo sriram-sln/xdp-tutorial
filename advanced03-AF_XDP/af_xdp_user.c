@@ -27,6 +27,7 @@
 #include <linux/icmpv6.h>
 #include <linux/icmp.h>
 #include <netinet/ip.h>
+#include <netinet/in.h>
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -278,6 +279,24 @@ static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
 	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
 }
 
+unsigned short checksum(void *b, int len) {
+    unsigned short *buf = b;
+    unsigned int sum = 0;
+    unsigned short result;
+    
+    for (sum = 0; len > 1; len -= 2)
+        sum += *buf++;
+    
+    if (len == 1)
+        sum += *(unsigned char *)buf;
+    
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    result = ~sum;
+    
+    return result;
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
@@ -345,9 +364,44 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	if (ip->protocol == IPPROTO_UDP) {
 
 	} else if (ip->protocol == IPPROTO_ICMP) {
-		struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + sizeof(iphdr));
+		struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
 		if (icmp->type == ICMP_ECHO) {
-			printf("Received Echo Request: {}");
+			int ret;
+			printf("Received Echo Request\n");
+			uint8_t tmp_mac[ETH_ALEN];
+			memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+			memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+			memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+			struct in_addr_t tmp_ip;
+
+			memcpy(&tmp_ip, &ip->saddr, sizeof(tmp_ip));
+			memcpy(&ip->saddr, &ip->daddr, sizeof(tmp_ip));
+			memcpy(&ip->daddr, &tmp_ip, sizeof(tmp_ip));
+
+			ip->check = checksum(ip, sizeof(struct iphdr));
+
+
+			icmp->type = ICMP_ECHOREPLY;
+			icmp->checksum = checksum(icmp, sizeof(struct icmphdr));
+
+			uint32_t tx_idx = 0;
+
+			ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+			if (ret != 1) {
+				/* No more transmit slots, drop the packet */
+				return false;
+			}
+
+			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+			xsk_ring_prod__submit(&xsk->tx, 1);
+			xsk->outstanding_tx++;
+
+			xsk->stats.tx_bytes += len;
+			xsk->stats.tx_packets++;
+			return true;
+
 		}
 	}
 	// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
