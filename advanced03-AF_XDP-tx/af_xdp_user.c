@@ -166,7 +166,7 @@ int client_init( struct client_t * client, const char * interface_name )
 
     printf( "loading client_xdp...\n" );
 
-    client->program = xdp_program__open_file( "client_xdp.o", "client_xdp", NULL );
+    client->program = xdp_program__open_file( "af_xdp_kern.o", "client_xdp", NULL );
     if ( libxdp_get_error( client->program ) ) 
     {
         printf( "\nerror: could not load client_xdp program\n\n");
@@ -507,6 +507,7 @@ int main( int argc, char * argv[] )
     while ( !quit )
     {
         client_update( &client );
+		break;
     }
 
     cleanup();
