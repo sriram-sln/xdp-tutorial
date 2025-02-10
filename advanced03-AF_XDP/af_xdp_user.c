@@ -316,6 +316,8 @@ unsigned short compute_checksum(void *data, int length) {
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
 
+	printf("Checksum: %d\n", sum);
+
     return (unsigned short)(~sum);
 }
 
