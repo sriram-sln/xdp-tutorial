@@ -331,6 +331,46 @@ void print_hex(const void *data, size_t size) {
     printf("\n"); // Ensure the last line is terminated
 }
 
+
+// Pseudo-header for UDP checksum calculation
+typedef struct pseudo_header_s {
+    unsigned int source_ip;
+    unsigned int dest_ip;
+    unsigned char reserved;
+    unsigned char protocol;
+    unsigned short udp_length;
+} pseudo_header_t;
+
+// Function to compute UDP checksum
+unsigned short compute_udp_checksum(struct iphdr *ip, struct udphdr *udp, char *payload, int payload_len) {
+    struct pseudo_header psh;
+    int udp_len = sizeof(struct udphdr) + payload_len;
+    int psh_len = sizeof(struct pseudo_header) + udp_len;
+    unsigned char *buffer = (unsigned char *) malloc(psh_len);
+    
+    if (!buffer) {
+        perror("Memory allocation failed");
+        exit(1);
+    }
+
+    // Fill pseudo-header
+    psh.source_ip = ip->saddr;
+    psh.dest_ip = ip->daddr;
+    psh.reserved = 0;
+    psh.protocol = IPPROTO_UDP;
+    psh.udp_length = htons(udp_len);
+
+    // Copy pseudo-header, UDP header, and payload into buffer
+    memcpy(buffer, &psh, sizeof(struct pseudo_header));
+    memcpy(buffer + sizeof(struct pseudo_header), udp, sizeof(struct udphdr));
+    memcpy(buffer + sizeof(struct pseudo_header) + sizeof(struct udphdr), payload, payload_len);
+
+    // Compute checksum
+    unsigned short checksum = compute_checksum(buffer, psh_len);
+    free(buffer);
+    return checksum;
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
@@ -418,7 +458,6 @@ static bool process_packet(struct xsk_socket_info *xsk,
 
 			icmp->type = ICMP_ECHOREPLY;
 			ip->check = compute_checksum(ip, sizeof(struct iphdr));
-			printf("Checksum: %d\n", ip->check);
 			icmp->checksum = compute_checksum(icmp, sizeof(struct icmphdr));
 			uint32_t tx_idx = 0;
 
