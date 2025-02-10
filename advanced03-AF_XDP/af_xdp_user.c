@@ -299,6 +299,26 @@ unsigned short checksum(void *b, int len) {
     return result;
 }
 
+unsigned short compute_checksum(void *data, int length) {
+    unsigned short *ptr = (unsigned short *)data;
+    unsigned long sum = 0;
+
+    while (length > 1) {
+        sum += *ptr++;
+        length -= 2;
+    }
+
+    if (length == 1) {
+        sum += *(unsigned char *)ptr;
+    }
+
+    // Fold 32-bit sum to 16-bit and complement
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (unsigned short)(~sum);
+}
+
 void print_hex(const void *data, size_t size) {
     const uint8_t *bytes = (const uint8_t *)data;
     
@@ -393,12 +413,12 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			memcpy(&ip->saddr, &ip->daddr, sizeof(tmp_ip));
 			memcpy(&ip->daddr, &tmp_ip, sizeof(tmp_ip));
 
-			ip->check = checksum(ip, sizeof(struct iphdr));
+			
 
 
 			icmp->type = ICMP_ECHOREPLY;
-			icmp->checksum = checksum(icmp, sizeof(struct icmphdr));
-
+			ip->check = compute_checksum(ip, sizeof(struct iphdr));
+			icmp->checksum = compute_checksum(icmp, sizeof(struct icmphdr));
 			uint32_t tx_idx = 0;
 
 			print_hex((void*)pkt, len);
