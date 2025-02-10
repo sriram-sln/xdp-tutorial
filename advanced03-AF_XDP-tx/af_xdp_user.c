@@ -1,792 +1,517 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/*
+    UDP client (userspace)
 
-#include <assert.h>
-#include <errno.h>
-#include <getopt.h>
-#include <locale.h>
-#include <poll.h>
-#include <pthread.h>
-#include <signal.h>
+    Runs on Ubuntu 22.04 LTS 64bit with Linux Kernel 6.5+ *ONLY*
+
+    Derived from https://github.com/xdp-project/xdp-tutorial/tree/master/advanced03-AF_XDP
+*/
+
+#define _GNU_SOURCE
+
+#include <memory.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <assert.h>
 #include <unistd.h>
-
-#include <sys/resource.h>
-
+#include <ifaddrs.h>
 #include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 #include <xdp/libxdp.h>
-
+#include <sys/resource.h>
+#include <stdlib.h>
 #include <arpa/inet.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
-#include <linux/ipv6.h>
-#include <linux/icmpv6.h>
-#include <linux/icmp.h>
-#include <netinet/ip.h>
-#include <netinet/in.h>
+#include <pthread.h>
+#include <sched.h>
+#include <errno.h>
+#include <inttypes.h>
 
-#include "../common/common_params.h"
-#include "../common/common_user_bpf_xdp.h"
-#include "../common/common_libbpf.h"
+const char * INTERFACE_NAME = "enp8s0f0";
 
-#define NUM_FRAMES         4096
-#define FRAME_SIZE         XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH_SIZE      64
-#define INVALID_UMEM_FRAME UINT64_MAX
+const uint8_t CLIENT_ETHERNET_ADDRESS[] = { 0xa0, 0x36, 0x9f, 0x68, 0xeb, 0x98 };
 
-static struct xdp_program *prog;
-int xsk_map_fd;
-bool custom_xsk = false;
-struct config cfg = {
-	.ifindex   = -1,
+const uint8_t SERVER_ETHERNET_ADDRESS[] = { 0xa0, 0x36, 0x9f, 0x1e, 0x1a, 0xec };
+
+const uint32_t CLIENT_IPV4_ADDRESS = 0xc0a8b779; // 192.168.183.121
+
+const uint32_t SERVER_IPV4_ADDRESS = 0xc0a8b77c; // 192.168.183.124
+
+const uint16_t SERVER_PORT = 40000;
+
+const uint16_t CLIENT_PORT = 40000;
+
+const int PAYLOAD_BYTES = 100;
+
+const int SEND_BATCH_SIZE = 256;
+
+#define NUM_FRAMES 4096
+
+#define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
+
+#define INVALID_FRAME UINT64_MAX
+
+struct client_t
+{
+    int interface_index;
+    struct xdp_program * program;
+    bool attached_native;
+    bool attached_skb;
+    void * buffer;
+    struct xsk_umem * umem;
+    struct xsk_ring_prod send_queue;
+    struct xsk_ring_cons complete_queue;
+    struct xsk_ring_prod fill_queue; // not used
+    struct xsk_socket * xsk;
+    uint64_t frames[NUM_FRAMES];
+    uint32_t num_frames;
+    uint64_t current_sent_packets;
+    uint64_t previous_sent_packets;
+    pthread_t stats_thread;
 };
 
-struct xsk_umem_info {
-	struct xsk_ring_prod fq;
-	struct xsk_ring_cons cq;
-	struct xsk_umem *umem;
-	void *buffer;
-};
-struct stats_record {
-	uint64_t timestamp;
-	uint64_t rx_packets;
-	uint64_t rx_bytes;
-	uint64_t tx_packets;
-	uint64_t tx_bytes;
-};
-struct xsk_socket_info {
-	struct xsk_ring_cons rx;
-	struct xsk_ring_prod tx;
-	struct xsk_umem_info *umem;
-	struct xsk_socket *xsk;
+volatile bool quit;
 
-	uint64_t umem_frame_addr[NUM_FRAMES];
-	uint32_t umem_frame_free;
-
-	uint32_t outstanding_tx;
-
-	struct stats_record stats;
-	struct stats_record prev_stats;
-};
-
-static inline __u32 xsk_ring_prod__free(struct xsk_ring_prod *r)
+static void * stats_thread( void * arg )
 {
-	r->cached_cons = *r->consumer + r->size;
-	return r->cached_cons - r->cached_prod;
+    struct client_t * client = (struct client_t*) arg;
+
+    while ( !quit )
+    {
+        usleep( 1000000 );
+
+        uint64_t sent_packets = client->current_sent_packets;
+
+        uint64_t sent_delta = sent_packets - client->previous_sent_packets;
+
+        printf( "sent delta %" PRId64 "\n", sent_delta );
+
+        client->previous_sent_packets = sent_packets;
+    }
+
+    return NULL;
 }
 
-static const char *__doc__ = "AF_XDP kernel bypass example\n";
-
-static const struct option_wrapper long_options[] = {
-
-	{{"help",	 no_argument,		NULL, 'h' },
-	 "Show help", false},
-
-	{{"dev",	 required_argument,	NULL, 'd' },
-	 "Operate on device <ifname>", "<ifname>", true},
-
-	{{"skb-mode",	 no_argument,		NULL, 'S' },
-	 "Install XDP program in SKB (AKA generic) mode"},
-
-	{{"native-mode", no_argument,		NULL, 'N' },
-	 "Install XDP program in native mode"},
-
-	{{"auto-mode",	 no_argument,		NULL, 'A' },
-	 "Auto-detect SKB or native mode"},
-
-	{{"force",	 no_argument,		NULL, 'F' },
-	 "Force install, replacing existing program on interface"},
-
-	{{"copy",        no_argument,		NULL, 'c' },
-	 "Force copy mode"},
-
-	{{"zero-copy",	 no_argument,		NULL, 'z' },
-	 "Force zero-copy mode"},
-
-	{{"queue",	 required_argument,	NULL, 'Q' },
-	 "Configure interface receive queue for AF_XDP, default=0"},
-
-	{{"poll-mode",	 no_argument,		NULL, 'p' },
-	 "Use the poll() API waiting for packets to arrive"},
-
-	{{"quiet",	 no_argument,		NULL, 'q' },
-	 "Quiet mode (no output)"},
-
-	{{"filename",    required_argument,	NULL,  1  },
-	 "Load program from <file>", "<file>"},
-
-	{{"progname",	 required_argument,	NULL,  2  },
-	 "Load program from function <name> in the ELF file", "<name>"},
-
-	{{0, 0, NULL,  0 }, NULL, false}
-};
-
-static bool global_exit;
-
-static struct xsk_umem_info *configure_xsk_umem(void *buffer, uint64_t size)
+bool pin_thread_to_cpu( int cpu ) 
 {
-	struct xsk_umem_info *umem;
-	int ret;
+    int num_cpus = sysconf( _SC_NPROCESSORS_ONLN );
+    if ( cpu < 0 || cpu >= num_cpus  )
+        return false;
 
-	umem = calloc(1, sizeof(*umem));
-	if (!umem)
-		return NULL;
+    cpu_set_t cpuset;
+    CPU_ZERO( &cpuset );
+    CPU_SET( cpu, &cpuset );
 
-	ret = xsk_umem__create(&umem->umem, buffer, size, &umem->fq, &umem->cq,
-			       NULL);
-	if (ret) {
-		errno = -ret;
-		return NULL;
-	}
+    pthread_t current_thread = pthread_self();    
 
-	umem->buffer = buffer;
-	return umem;
+    pthread_setaffinity_np( current_thread, sizeof(cpu_set_t), &cpuset );
 }
 
-static uint64_t xsk_alloc_umem_frame(struct xsk_socket_info *xsk)
+int client_init( struct client_t * client, const char * interface_name )
 {
-	uint64_t frame;
-	if (xsk->umem_frame_free == 0)
-		return INVALID_UMEM_FRAME;
+    // we can only run xdp programs as root
 
-	frame = xsk->umem_frame_addr[--xsk->umem_frame_free];
-	xsk->umem_frame_addr[xsk->umem_frame_free] = INVALID_UMEM_FRAME;
-	return frame;
+    if ( geteuid() != 0 ) 
+    {
+        printf( "\nerror: this program must be run as root\n\n" );
+        return 1;
+    }
+
+    // find the network interface that matches the interface name
+    {
+        bool found = false;
+
+        struct ifaddrs * addrs;
+        if ( getifaddrs( &addrs ) != 0 )
+        {
+            printf( "\nerror: getifaddrs failed\n\n" );
+            return 1;
+        }
+
+        for ( struct ifaddrs * iap = addrs; iap != NULL; iap = iap->ifa_next ) 
+        {
+            if ( iap->ifa_addr && ( iap->ifa_flags & IFF_UP ) && iap->ifa_addr->sa_family == AF_INET )
+            {
+                struct sockaddr_in * sa = (struct sockaddr_in*) iap->ifa_addr;
+                if ( strcmp( interface_name, iap->ifa_name ) == 0 )
+                {
+                    printf( "found network interface: '%s'\n", iap->ifa_name );
+                    client->interface_index = if_nametoindex( iap->ifa_name );
+                    if ( !client->interface_index ) 
+                    {
+                        printf( "\nerror: if_nametoindex failed\n\n" );
+                        return 1;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        freeifaddrs( addrs );
+
+        if ( !found )
+        {
+            printf( "\nerror: could not find any network interface matching '%s'\n\n", interface_name );
+            return 1;
+        }
+    }
+
+    // load the client_xdp program and attach it to the network interface
+
+    printf( "loading client_xdp...\n" );
+
+    client->program = xdp_program__open_file( "client_xdp.o", "client_xdp", NULL );
+    if ( libxdp_get_error( client->program ) ) 
+    {
+        printf( "\nerror: could not load client_xdp program\n\n");
+        return 1;
+    }
+
+    printf( "client_xdp loaded successfully.\n" );
+
+    printf( "attaching client_xdp to network interface\n" );
+
+    int ret = xdp_program__attach( client->program, client->interface_index, XDP_MODE_NATIVE, 0 );
+    if ( ret == 0 )
+    {
+        client->attached_native = true;
+    } 
+    else
+    {
+        printf( "falling back to skb mode...\n" );
+        ret = xdp_program__attach( client->program, client->interface_index, XDP_MODE_SKB, 0 );
+        if ( ret == 0 )
+        {
+            client->attached_skb = true;
+        }
+        else
+        {
+            printf( "\nerror: failed to attach client_xdp program to interface\n\n" );
+            return 1;
+        }
+    }
+
+    // allow unlimited locking of memory, so all memory needed for packet buffers can be locked
+
+    struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
+
+    if ( setrlimit( RLIMIT_MEMLOCK, &rlim ) ) 
+    {
+        printf( "\nerror: could not setrlimit\n\n");
+        return 1;
+    }
+
+    // allocate buffer for umem
+
+    const int buffer_size = NUM_FRAMES * FRAME_SIZE;
+
+    if ( posix_memalign( &client->buffer, getpagesize(), buffer_size ) ) 
+    {
+        printf( "\nerror: could not allocate buffer\n\n" );
+        return 1;
+    }
+
+    // allocate umem
+
+    ret = xsk_umem__create( &client->umem, client->buffer, buffer_size, &client->fill_queue, &client->complete_queue, NULL );
+    if ( ret ) 
+    {
+        printf( "\nerror: could not create umem\n\n" );
+        return 1;
+    }
+
+    // create xsk socket and assign to network interface queue 0
+
+    struct xsk_socket_config xsk_config;
+
+    memset( &xsk_config, 0, sizeof(xsk_config) );
+
+    xsk_config.rx_size = 0;
+    xsk_config.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+    xsk_config.xdp_flags = 0;
+    xsk_config.bind_flags = 0;
+    xsk_config.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
+
+    int queue_id = 0;
+
+    ret = xsk_socket__create( &client->xsk, interface_name, queue_id, client->umem, NULL, &client->send_queue, &xsk_config );
+    if ( ret )
+    {
+        printf( "\nerror: could not create xsk socket\n\n" );
+        return 1;
+    }
+
+    // pin this thread to CPU 0 so it matches the queue id
+
+    pin_thread_to_cpu( 0 );
+
+    // initialize frame allocator
+
+    for ( int i = 0; i < NUM_FRAMES; i++ )
+    {
+        client->frames[i] = i * FRAME_SIZE;
+    }
+
+    client->num_frames = NUM_FRAMES;
+
+    // create stats thread
+
+    ret = pthread_create( &client->stats_thread, NULL, stats_thread, client );
+    if ( ret ) 
+    {
+        printf( "\nerror: could not create stats thread\n\n" );
+        return 1;
+    }
+
+    printf("client init: OK!\n");
+    return 0;
 }
 
-static void xsk_free_umem_frame(struct xsk_socket_info *xsk, uint64_t frame)
+void client_shutdown( struct client_t * client )
 {
-	assert(xsk->umem_frame_free < NUM_FRAMES);
+    assert( client );
 
-	xsk->umem_frame_addr[xsk->umem_frame_free++] = frame;
+    if ( client->program != NULL )
+    {
+        if ( client->attached_native )
+        {
+            xdp_program__detach( client->program, client->interface_index, XDP_MODE_NATIVE, 0 );
+        }
+
+        if ( client->attached_skb )
+        {
+            xdp_program__detach( client->program, client->interface_index, XDP_MODE_SKB, 0 );
+        }
+
+        xdp_program__close( client->program );
+
+        xsk_socket__delete( client->xsk );
+
+        xsk_umem__delete( client->umem );
+
+        free( client->buffer );
+    }
 }
 
-static uint64_t xsk_umem_free_frames(struct xsk_socket_info *xsk)
+static struct client_t client;
+
+void interrupt_handler( int signal )
 {
-	return xsk->umem_frame_free;
+    (void) signal; quit = true;
 }
 
-static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
-						    struct xsk_umem_info *umem)
+void clean_shutdown_handler( int signal )
 {
-	struct xsk_socket_config xsk_cfg;
-	struct xsk_socket_info *xsk_info;
-	uint32_t idx;
-	int i;
-	int ret;
-	uint32_t prog_id;
-
-	xsk_info = calloc(1, sizeof(*xsk_info));
-	if (!xsk_info)
-		return NULL;
-
-	xsk_info->umem = umem;
-	xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-	xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-	xsk_cfg.xdp_flags = cfg->xdp_flags;
-	xsk_cfg.bind_flags = cfg->xsk_bind_flags;
-	xsk_cfg.libbpf_flags = (custom_xsk) ? XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD: 0;
-	ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
-				 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
-				 &xsk_info->tx, &xsk_cfg);
-	if (ret)
-		goto error_exit;
-
-	if (custom_xsk) {
-		ret = xsk_socket__update_xskmap(xsk_info->xsk, xsk_map_fd);
-		if (ret)
-			goto error_exit;
-	} else {
-		/* Getting the program ID must be after the xdp_socket__create() call */
-		if (bpf_xdp_query_id(cfg->ifindex, cfg->xdp_flags, &prog_id))
-			goto error_exit;
-	}
-
-	/* Initialize umem frame allocation */
-	for (i = 0; i < NUM_FRAMES; i++)
-		xsk_info->umem_frame_addr[i] = i * FRAME_SIZE;
-
-	xsk_info->umem_frame_free = NUM_FRAMES;
-
-	/* Stuff the receive path with buffers, we assume we have enough */
-	ret = xsk_ring_prod__reserve(&xsk_info->umem->fq,
-				     XSK_RING_PROD__DEFAULT_NUM_DESCS,
-				     &idx);
-
-	if (ret != XSK_RING_PROD__DEFAULT_NUM_DESCS)
-		goto error_exit;
-
-	for (i = 0; i < XSK_RING_PROD__DEFAULT_NUM_DESCS; i ++)
-		*xsk_ring_prod__fill_addr(&xsk_info->umem->fq, idx++) =
-			xsk_alloc_umem_frame(xsk_info);
-
-	xsk_ring_prod__submit(&xsk_info->umem->fq,
-			      XSK_RING_PROD__DEFAULT_NUM_DESCS);
-
-	return xsk_info;
-
-error_exit:
-	errno = -ret;
-	return NULL;
+    (void) signal;
+    quit = true;
 }
 
-static void complete_tx(struct xsk_socket_info *xsk)
+static void cleanup()
 {
-	unsigned int completed;
-	uint32_t idx_cq;
-
-	if (!xsk->outstanding_tx)
-		return;
-
-	sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-
-	/* Collect/free completed TX buffers */
-	completed = xsk_ring_cons__peek(&xsk->umem->cq,
-					XSK_RING_CONS__DEFAULT_NUM_DESCS,
-					&idx_cq);
-
-	printf("Completed: %d", completed);
-
-	if (completed > 0) {
-		for (int i = 0; i < completed; i++)
-			xsk_free_umem_frame(xsk,
-					    *xsk_ring_cons__comp_addr(&xsk->umem->cq,
-								      idx_cq++));
-
-		xsk_ring_cons__release(&xsk->umem->cq, completed);
-		xsk->outstanding_tx -= completed < xsk->outstanding_tx ?
-			completed : xsk->outstanding_tx;
-	}
+    client_shutdown( &client );
+    fflush( stdout );
 }
 
-static inline __sum16 csum16_add(__sum16 csum, __be16 addend)
+uint64_t client_alloc_frame( struct client_t * client )
 {
-	uint16_t res = (uint16_t)csum;
-
-	res += (__u16)addend;
-	return (__sum16)(res + (res < (__u16)addend));
+    if ( client->num_frames == 0 )
+        return INVALID_FRAME;
+    client->num_frames--;
+    uint64_t frame = client->frames[client->num_frames];
+    client->frames[client->num_frames] = INVALID_FRAME;
+    return frame;
 }
 
-static inline __sum16 csum16_sub(__sum16 csum, __be16 addend)
+void client_free_frame( struct client_t * client, uint64_t frame )
 {
-	return csum16_add(csum, ~addend);
+    assert( client->num_frames < NUM_FRAMES );
+    client->frames[client->num_frames] = frame;
+    client->num_frames++;
 }
 
-static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new)
+uint16_t ipv4_checksum( const void * data, size_t header_length )
 {
-	*sum = ~csum16_add(csum16_sub(~(*sum), old), new);
-}
-
-unsigned short checksum(void *b, int len) {
-    unsigned short *buf = b;
-    unsigned int sum = 0;
-    unsigned short result;
-    
-    for (sum = 0; len > 1; len -= 2)
-        sum += *buf++;
-    
-    if (len == 1)
-        sum += *(unsigned char *)buf;
-    
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    result = ~sum;
-    
-    return result;
-}
-
-unsigned short compute_checksum(void *data, int length) {
-    unsigned short *ptr = (unsigned short *)data;
     unsigned long sum = 0;
 
-    while (length > 1) {
-        sum += *ptr++;
-        length -= 2;
+    const uint16_t * p = (const uint16_t*) data;
+
+    while ( header_length > 1 )
+    {
+        sum += *p++;
+        if ( sum & 0x80000000 )
+        {
+            sum = ( sum & 0xFFFF ) + ( sum >> 16 );
+        }
+        header_length -= 2;
     }
 
-    if (length == 1) {
-        sum += *(unsigned char *)ptr;
+    while ( sum >> 16 )
+    {
+        sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
-    // Fold 32-bit sum to 16-bit and complement
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16);
-
-    return (unsigned short)(~sum);
+    return ~sum;
 }
 
-void print_hex(const void *data, size_t size) {
-    const uint8_t *bytes = (const uint8_t *)data;
-    
-    for (size_t i = 0; i < size; ++i) {
-        printf("%02x ", bytes[i]); // Print each byte in hex format
+int client_generate_packet( void * data, int payload_bytes )
+{
+    struct ethhdr * eth = data;
+    struct iphdr  * ip  = data + sizeof( struct ethhdr );
+    struct udphdr * udp = (void*) ip + sizeof( struct iphdr );
 
-        if ((i + 1) % 16 == 0) // Print 16 bytes per line
-            printf("\n");
+    // generate ethernet header
+
+    memcpy( eth->h_dest, SERVER_ETHERNET_ADDRESS, ETH_ALEN );
+    memcpy( eth->h_source, CLIENT_ETHERNET_ADDRESS, ETH_ALEN );
+    eth->h_proto = htons( ETH_P_IP );
+
+    // generate ip header
+
+    ip->ihl      = 5;
+    ip->version  = 4;
+    ip->tos      = 0x0;
+    ip->id       = 0;
+    ip->frag_off = htons(0x4000);
+    ip->ttl      = 64;
+    ip->tot_len  = htons( sizeof(struct iphdr) + sizeof(struct udphdr) + payload_bytes );
+    ip->protocol = IPPROTO_UDP;
+    ip->saddr    = CLIENT_IPV4_ADDRESS;
+    ip->daddr    = SERVER_IPV4_ADDRESS;
+    ip->check    = 0; 
+    ip->check    = ipv4_checksum( ip, sizeof( struct iphdr ) );
+
+    // generate udp header
+
+    udp->source  = htons( CLIENT_PORT );
+    udp->dest    = htons( SERVER_PORT );
+    udp->len     = htons( sizeof(struct udphdr) + payload_bytes );
+    udp->check   = 0;
+
+    // generate udp payload
+
+    uint8_t * payload = (void*) udp + sizeof( struct udphdr );
+
+    for ( int i = 0; i < payload_bytes; i++ )
+    {
+        payload[i] = i;
     }
-    printf("\n"); // Ensure the last line is terminated
+
+    return sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct udphdr) + payload_bytes; 
 }
 
+int kick_tx( struct client_t * client )
+{
+    int err = 0;
+    int ret;
 
-// Pseudo-header for UDP checksum calculation
-typedef struct pseudo_header_s {
-    unsigned int source_ip;
-    unsigned int dest_ip;
-    unsigned char reserved;
-    unsigned char protocol;
-    unsigned short udp_length;
-} pseudo_header_t;
+    ret = sendto(xsk_socket__fd(client->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
+    if ( ret < 0 )
+    {
+        // On error, -1 is returned, and errno is set */
+        fprintf(stderr, "WARN: %s() sendto() failed with errno:%d\n", __func__, errno);
+        err = errno;
+    }
+    return err;
+}
 
-// Function to compute UDP checksum
-unsigned short compute_udp_checksum(struct iphdr *ip, struct udphdr *udp, char *payload, int payload_len) {
-    struct pseudo_header psh;
-    int udp_len = sizeof(struct udphdr) + payload_len;
-    int psh_len = sizeof(struct pseudo_header) + udp_len;
-    unsigned char *buffer = (unsigned char *) malloc(psh_len);
-    
-    if (!buffer) {
-        perror("Memory allocation failed");
-        exit(1);
+void client_update( struct client_t * client )
+{
+    // don't do anything if we don't have enough free packets to send a batch
+
+    if ( client->num_frames < SEND_BATCH_SIZE )
+        return;
+
+    // queue packets to send
+
+    int send_index;
+    int result = xsk_ring_prod__reserve( &client->send_queue, SEND_BATCH_SIZE, &send_index );
+    if ( result == 0 ) 
+    {
+        return;
     }
 
-    // Fill pseudo-header
-    psh.source_ip = ip->saddr;
-    psh.dest_ip = ip->daddr;
-    psh.reserved = 0;
-    psh.protocol = IPPROTO_UDP;
-    psh.udp_length = htons(udp_len);
+    int num_packets = 0;
+    uint64_t packet_address[SEND_BATCH_SIZE];
+    int packet_length[SEND_BATCH_SIZE];
 
-    // Copy pseudo-header, UDP header, and payload into buffer
-    memcpy(buffer, &psh, sizeof(struct pseudo_header));
-    memcpy(buffer + sizeof(struct pseudo_header), udp, sizeof(struct udphdr));
-    memcpy(buffer + sizeof(struct pseudo_header) + sizeof(struct udphdr), payload, payload_len);
+    while ( true )
+    {
+        uint64_t frame = client_alloc_frame( client );
 
-    // Compute checksum
-    unsigned short checksum = compute_checksum(buffer, psh_len);
-    free(buffer);
-    return checksum;
+        assert( frame != INVALID_FRAME );   // this should never happen
+
+        uint8_t * packet = client->buffer + frame;
+
+        packet_address[num_packets] = frame;
+        packet_length[num_packets] = client_generate_packet( packet, PAYLOAD_BYTES );
+
+        num_packets++;
+
+        if ( num_packets == SEND_BATCH_SIZE )
+            break;
+    }
+
+    for ( int i = 0; i < num_packets; i++ )
+    {
+        struct xdp_desc * desc = xsk_ring_prod__tx_desc( &client->send_queue, send_index + i );
+        desc->addr = packet_address[i];
+        desc->len = packet_length[i];
+    }
+
+    xsk_ring_prod__submit( &client->send_queue, num_packets );
+    // In copy mode (MODE_SKB), Tx is driven by a syscall so we need to use e.g. sendto() to really send the packets.
+    if ( client->attached_skb )
+    {
+        kick_tx(client);
+    }
+
+    // mark completed sent packet frames as free to be reused
+
+    uint32_t complete_index;
+
+    unsigned int completed = xsk_ring_cons__peek( &client->complete_queue, XSK_RING_CONS__DEFAULT_NUM_DESCS, &complete_index );
+
+    if ( completed > 0 ) 
+    {
+        for ( int i = 0; i < completed; i++ )
+        {
+            client_free_frame( client, *xsk_ring_cons__comp_addr( &client->complete_queue, complete_index++ ) );
+        }
+
+        xsk_ring_cons__release( &client->complete_queue, completed );
+
+        __sync_fetch_and_add( &client->current_sent_packets, completed );
+    }
 }
 
-static bool process_packet(struct xsk_socket_info *xsk,
-			   uint64_t addr, uint32_t len)
+int main( int argc, char * argv[] )
 {
-	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+    printf( "\n[client]\n" );
 
-	/* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
-	 *
-	 * Some assumptions to make it easier:
-	 * - No VLAN handling
-	 * - Only if nexthdr is ICMP
-	 * - Just return all data with MAC/IP swapped, and type set to
-	 *   ICMPV6_ECHO_REPLY
-	 * - Recalculate the icmp checksum */
+    signal( SIGINT,  interrupt_handler );
+    signal( SIGTERM, clean_shutdown_handler );
+    signal( SIGHUP,  clean_shutdown_handler );
 
-	// if (false) {
-	// 	int ret;
-	// 	uint32_t tx_idx = 0;
-	// 	uint8_t tmp_mac[ETH_ALEN];
-	// 	struct in6_addr tmp_ip;
-	// 	struct ethhdr *eth = (struct ethhdr *) pkt;
-	// 	struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-	// 	struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+    if ( client_init( &client, INTERFACE_NAME ) != 0 )
+    {
+        cleanup();
+        return 1;
+    }
 
-	// 	if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-	// 	    len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-	// 	    ipv6->nexthdr != IPPROTO_ICMPV6 ||
-	// 	    icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-	// 		return false;
+    while ( !quit )
+    {
+        client_update( &client );
+    }
 
-	// 	memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-	// 	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-	// 	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+    cleanup();
 
-	// 	memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-	// 	memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-	// 	memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+    printf( "\n" );
 
-	// 	icmp->icmp6_type = ICMPV6_ECHO_REPLY;
-
-	// 	csum_replace2(&icmp->icmp6_cksum,
-	// 		      htons(ICMPV6_ECHO_REQUEST << 8),
-	// 		      htons(ICMPV6_ECHO_REPLY << 8));
-
-	// 	/* Here we sent the packet out of the receive port. Note that
-	// 	 * we allocate one entry and schedule it. Your design would be
-	// 	 * faster if you do batch processing/transmission */
-
-	// 	ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-	// 	if (ret != 1) {
-	// 		/* No more transmit slots, drop the packet */
-	// 		return false;
-	// 	}
-
-	// 	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-	// 	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-	// 	xsk_ring_prod__submit(&xsk->tx, 1);
-	// 	xsk->outstanding_tx++;
-
-	// 	xsk->stats.tx_bytes += len;
-	// 	xsk->stats.tx_packets++;
-	// 	return true;
-	// }
-	struct ethhdr *eth = (struct ethhdr *) pkt;
-	struct iphdr *ip = (struct iphdr *) (pkt + sizeof(struct ethhdr));
-	if (ip->protocol == IPPROTO_UDP) {
-
-	} else if (ip->protocol == IPPROTO_ICMP) {
-		struct icmphdr *icmp = (struct icmphdr *) (pkt + sizeof(struct ethhdr) + sizeof(struct iphdr));
-		if (icmp->type == ICMP_ECHO) {
-			int ret;
-			printf("Received Echo Request\n");
-			uint8_t tmp_mac[ETH_ALEN];
-			memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-			memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-			memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-			uint32_t tmp_ip;
-
-			memcpy(&tmp_ip, &ip->saddr, sizeof(tmp_ip));
-			memcpy(&ip->saddr, &ip->daddr, sizeof(tmp_ip));
-			memcpy(&ip->daddr, &tmp_ip, sizeof(tmp_ip));
-
-			
-
-
-			icmp->type = ICMP_ECHOREPLY;
-			ip->check = compute_checksum(ip, sizeof(struct iphdr));
-			icmp->checksum = compute_checksum(icmp, sizeof(struct icmphdr));
-			uint32_t tx_idx = 0;
-
-			print_hex((void*)pkt, len);
-
-			ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-			if (ret != 1) {
-				/* No more transmit slots, drop the packet */
-				return false;
-			}
-
-			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-			xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-			xsk_ring_prod__submit(&xsk->tx, 1);
-			xsk->outstanding_tx++;
-
-			xsk->stats.tx_bytes += len;
-			xsk->stats.tx_packets++;
-			return true;
-
-		}
-	}
-	
-	// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-	// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
-
-	return false;
-}
-
-static void handle_receive_packets(struct xsk_socket_info *xsk)
-{
-	unsigned int rcvd, stock_frames, i;
-	uint32_t idx_rx = 0, idx_fq = 0;
-	int ret;
-
-	rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
-	if (!rcvd)
-		return;
-
-	/* Stuff the ring with as much frames as possible */
-	stock_frames = xsk_prod_nb_free(&xsk->umem->fq,
-					xsk_umem_free_frames(xsk));
-
-	if (stock_frames > 0) {
-
-		ret = xsk_ring_prod__reserve(&xsk->umem->fq, stock_frames,
-					     &idx_fq);
-
-		/* This should not happen, but just in case */
-		while (ret != stock_frames)
-			ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd,
-						     &idx_fq);
-
-		for (i = 0; i < stock_frames; i++)
-			*xsk_ring_prod__fill_addr(&xsk->umem->fq, idx_fq++) =
-				xsk_alloc_umem_frame(xsk);
-
-		xsk_ring_prod__submit(&xsk->umem->fq, stock_frames);
-	}
-
-	/* Process received packets */
-	for (i = 0; i < rcvd; i++) {
-		uint64_t addr = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx)->addr;
-		uint32_t len = xsk_ring_cons__rx_desc(&xsk->rx, idx_rx++)->len;
-
-		if (!process_packet(xsk, addr, len))
-			xsk_free_umem_frame(xsk, addr);
-
-		xsk->stats.rx_bytes += len;
-	}
-
-	xsk_ring_cons__release(&xsk->rx, rcvd);
-	xsk->stats.rx_packets += rcvd;
-
-	/* Do we need to wake up the kernel for transmission */
-	complete_tx(xsk);
-  }
-
-static void rx_and_process(struct config *cfg,
-			   struct xsk_socket_info *xsk_socket)
-{
-	struct pollfd fds[2];
-	int ret, nfds = 1;
-
-	memset(fds, 0, sizeof(fds));
-	fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
-	fds[0].events = POLLIN;
-
-	while(!global_exit) {
-		if (cfg->xsk_poll_mode) {
-			ret = poll(fds, nfds, -1);
-			if (ret <= 0 || ret > 1)
-				continue;
-		}
-		handle_receive_packets(xsk_socket);
-	}
-}
-
-#define NANOSEC_PER_SEC 1000000000 /* 10^9 */
-static uint64_t gettime(void)
-{
-	struct timespec t;
-	int res;
-
-	res = clock_gettime(CLOCK_MONOTONIC, &t);
-	if (res < 0) {
-		fprintf(stderr, "Error with gettimeofday! (%i)\n", res);
-		exit(EXIT_FAIL);
-	}
-	return (uint64_t) t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
-}
-
-static double calc_period(struct stats_record *r, struct stats_record *p)
-{
-	double period_ = 0;
-	__u64 period = 0;
-
-	period = r->timestamp - p->timestamp;
-	if (period > 0)
-		period_ = ((double) period / NANOSEC_PER_SEC);
-
-	return period_;
-}
-
-static void stats_print(struct stats_record *stats_rec,
-			struct stats_record *stats_prev)
-{
-	uint64_t packets, bytes;
-	double period;
-	double pps; /* packets per sec */
-	double bps; /* bits per sec */
-
-	char *fmt = "%-12s %'11lld pkts (%'10.0f pps)"
-		" %'11lld Kbytes (%'6.0f Mbits/s)"
-		" period:%f\n";
-
-	period = calc_period(stats_rec, stats_prev);
-	if (period == 0)
-		period = 1;
-
-	packets = stats_rec->rx_packets - stats_prev->rx_packets;
-	pps     = packets / period;
-
-	bytes   = stats_rec->rx_bytes   - stats_prev->rx_bytes;
-	bps     = (bytes * 8) / period / 1000000;
-
-	printf(fmt, "AF_XDP RX:", stats_rec->rx_packets, pps,
-	       stats_rec->rx_bytes / 1000 , bps,
-	       period);
-
-	packets = stats_rec->tx_packets - stats_prev->tx_packets;
-	pps     = packets / period;
-
-	bytes   = stats_rec->tx_bytes   - stats_prev->tx_bytes;
-	bps     = (bytes * 8) / period / 1000000;
-
-	printf(fmt, "       TX:", stats_rec->tx_packets, pps,
-	       stats_rec->tx_bytes / 1000 , bps,
-	       period);
-
-	printf("\n");
-}
-
-static void *stats_poll(void *arg)
-{
-	unsigned int interval = 2;
-	struct xsk_socket_info *xsk = arg;
-	static struct stats_record previous_stats = { 0 };
-
-	previous_stats.timestamp = gettime();
-
-	/* Trick to pretty printf with thousands separators use %' */
-	setlocale(LC_NUMERIC, "en_US");
-
-	while (!global_exit) {
-		sleep(interval);
-		xsk->stats.timestamp = gettime();
-		stats_print(&xsk->stats, &previous_stats);
-		previous_stats = xsk->stats;
-	}
-	return NULL;
-}
-
-static void exit_application(int signal)
-{
-	int err;
-
-	cfg.unload_all = true;
-	err = do_unload(&cfg);
-	if (err) {
-		fprintf(stderr, "Couldn't detach XDP program on iface '%s' : (%d)\n",
-			cfg.ifname, err);
-	}
-
-	signal = signal;
-	global_exit = true;
-}
-
-int main(int argc, char **argv)
-{
-	int ret;
-	void *packet_buffer;
-	uint64_t packet_buffer_size;
-	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
-	DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts, 0);
-	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
-	struct xsk_umem_info *umem;
-	struct xsk_socket_info *xsk_socket;
-	pthread_t stats_poll_thread;
-	int err;
-	char errmsg[1024];
-
-	/* Global shutdown handler */
-	signal(SIGINT, exit_application);
-
-	/* Cmdline options can change progname */
-	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
-
-	/* Required option */
-	if (cfg.ifindex == -1) {
-		fprintf(stderr, "ERROR: Required option --dev missing\n\n");
-		usage(argv[0], __doc__, long_options, (argc == 1));
-		return EXIT_FAIL_OPTION;
-	}
-
-	/* Load custom program if configured */
-	if (cfg.filename[0] != 0) {
-		struct bpf_map *map;
-
-		custom_xsk = true;
-		xdp_opts.open_filename = cfg.filename;
-		xdp_opts.prog_name = cfg.progname;
-		xdp_opts.opts = &opts;
-
-		if (cfg.progname[0] != 0) {
-			xdp_opts.open_filename = cfg.filename;
-			xdp_opts.prog_name = cfg.progname;
-			xdp_opts.opts = &opts;
-
-			prog = xdp_program__create(&xdp_opts);
-		} else {
-			prog = xdp_program__open_file(cfg.filename,
-						  NULL, &opts);
-		}
-		err = libxdp_get_error(prog);
-		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "ERR: loading program: %s\n", errmsg);
-			return err;
-		}
-
-		err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
-		if (err) {
-			libxdp_strerror(err, errmsg, sizeof(errmsg));
-			fprintf(stderr, "Couldn't attach XDP program on iface '%s' : %s (%d)\n",
-				cfg.ifname, errmsg, err);
-			return err;
-		}
-
-		/* We also need to load the xsks_map */
-		map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), "xsks_map");
-		xsk_map_fd = bpf_map__fd(map);
-		if (xsk_map_fd < 0) {
-			fprintf(stderr, "ERROR: no xsks map found: %s\n",
-				strerror(xsk_map_fd));
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	/* Allow unlimited locking of memory, so all memory needed for packet
-	 * buffers can be locked.
-	 *
-	 * NOTE: since kernel v5.11, eBPF maps allocations are not tracked
-	 * through the process anymore. Now, eBPF maps are accounted to the
-	 * current cgroup of which the process that created the map is part of
-	 * (assuming the kernel was built with CONFIG_MEMCG).
-	 *
-	 * Therefore, you should ensure an appropriate memory.max setting on
-	 * the cgroup (via sysfs, for example) instead of relying on rlimit.
-	 */
-	if (setrlimit(RLIMIT_MEMLOCK, &rlim)) {
-		fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	/* Allocate memory for NUM_FRAMES of the default XDP frame size */
-	packet_buffer_size = NUM_FRAMES * FRAME_SIZE;
-	if (posix_memalign(&packet_buffer,
-			   getpagesize(), /* PAGE_SIZE aligned */
-			   packet_buffer_size)) {
-		fprintf(stderr, "ERROR: Can't allocate buffer memory \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	/* Initialize shared packet_buffer for umem usage */
-	umem = configure_xsk_umem(packet_buffer, packet_buffer_size);
-	if (umem == NULL) {
-		fprintf(stderr, "ERROR: Can't create umem \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	/* Open and configure the AF_XDP (xsk) socket */
-	xsk_socket = xsk_configure_socket(&cfg, umem);
-	if (xsk_socket == NULL) {
-		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
-			strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	/* Start thread to do statistics display */
-	if (verbose) {
-		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
-				     xsk_socket);
-		if (ret) {
-			fprintf(stderr, "ERROR: Failed creating statistics thread "
-				"\"%s\"\n", strerror(errno));
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	/* Receive and count packets than drop them */
-	rx_and_process(&cfg, xsk_socket);
-
-	/* Cleanup */
-	xsk_socket__delete(xsk_socket->xsk);
-	xsk_umem__delete(umem->umem);
-
-	return EXIT_OK;
+    return 0;
 }
