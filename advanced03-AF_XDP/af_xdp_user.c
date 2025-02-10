@@ -299,6 +299,18 @@ unsigned short checksum(void *b, int len) {
     return result;
 }
 
+void print_hex(const void *data, size_t size) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    
+    for (size_t i = 0; i < size; ++i) {
+        printf("%02x ", bytes[i]); // Print each byte in hex format
+
+        if ((i + 1) % 16 == 0) // Print 16 bytes per line
+            printf("\n");
+    }
+    printf("\n"); // Ensure the last line is terminated
+}
+
 static bool process_packet(struct xsk_socket_info *xsk,
 			   uint64_t addr, uint32_t len)
 {
@@ -389,6 +401,8 @@ static bool process_packet(struct xsk_socket_info *xsk,
 
 			uint32_t tx_idx = 0;
 
+			print_hex((void*)pkt, len);
+
 			ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
 			if (ret != 1) {
 				/* No more transmit slots, drop the packet */
@@ -406,6 +420,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 
 		}
 	}
+	
 	// struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
 	// struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
 
