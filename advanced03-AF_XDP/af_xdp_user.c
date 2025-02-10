@@ -373,7 +373,7 @@ static bool process_packet(struct xsk_socket_info *xsk,
 			memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
 			memcpy(eth->h_source, tmp_mac, ETH_ALEN);
 
-			struct in_addr_t tmp_ip;
+			uint32_t tmp_ip;
 
 			memcpy(&tmp_ip, &ip->saddr, sizeof(tmp_ip));
 			memcpy(&ip->saddr, &ip->daddr, sizeof(tmp_ip));
