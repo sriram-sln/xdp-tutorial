@@ -241,6 +241,8 @@ static void complete_tx(struct xsk_socket_info *xsk)
 
 	sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 
+	printf("yes\n");
+
 	/* Collect/free completed TX buffers */
 	completed = xsk_ring_cons__peek(&xsk->umem->cq,
 					XSK_RING_CONS__DEFAULT_NUM_DESCS,
