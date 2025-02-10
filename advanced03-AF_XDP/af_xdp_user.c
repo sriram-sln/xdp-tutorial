@@ -190,6 +190,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
 				 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
 				 &xsk_info->tx, &xsk_cfg);
+	printf("Queue: %d", cfg->xsk_if_queue);
 	if (ret)
 		goto error_exit;
 
@@ -240,8 +241,6 @@ static void complete_tx(struct xsk_socket_info *xsk)
 		return;
 
 	sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-
-	printf("yes\n");
 
 	/* Collect/free completed TX buffers */
 	completed = xsk_ring_cons__peek(&xsk->umem->cq,
