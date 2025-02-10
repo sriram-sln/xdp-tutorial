@@ -26,6 +26,7 @@
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
 #include <linux/icmp.h>
+#include <netinet/ip.h>
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
