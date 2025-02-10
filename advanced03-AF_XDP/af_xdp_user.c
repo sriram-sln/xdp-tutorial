@@ -190,7 +190,6 @@ static struct xsk_socket_info *xsk_configure_socket(struct config *cfg,
 	ret = xsk_socket__create(&xsk_info->xsk, cfg->ifname,
 				 cfg->xsk_if_queue, umem->umem, &xsk_info->rx,
 				 &xsk_info->tx, &xsk_cfg);
-	printf("Queue: %d", cfg->xsk_if_queue);
 	if (ret)
 		goto error_exit;
 
@@ -352,6 +351,8 @@ static void handle_receive_packets(struct xsk_socket_info *xsk)
 	rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
 	if (!rcvd)
 		return;
+	
+	printf("Received\n");
 
 	/* Stuff the ring with as much frames as possible */
 	stock_frames = xsk_prod_nb_free(&xsk->umem->fq,
