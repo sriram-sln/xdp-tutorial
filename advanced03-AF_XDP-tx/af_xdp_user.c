@@ -36,11 +36,11 @@ const char * INTERFACE_NAME = "eth6";
 
 const uint8_t CLIENT_ETHERNET_ADDRESS[] = { 0x06, 0xae, 0x47, 0xf0, 0xa9, 0x4f };
 
-const uint8_t SERVER_ETHERNET_ADDRESS[] = { 0x06, 0x78, 0x3f, 0x6d, 0xf0, 0xe7 };
+const uint8_t SERVER_ETHERNET_ADDRESS[] = { 0x0a, 0x60, 0x8a, 0x1b, 0x34, 0x7e };
 
 const uint32_t CLIENT_IPV4_ADDRESS = 0x0AB5B549; // 192.168.183.121
 
-const uint32_t SERVER_IPV4_ADDRESS = 0x0A320FE3; // 192.168.183.124
+const uint32_t SERVER_IPV4_ADDRESS = 0x0A320FCA; // 192.168.183.124
 
 const uint16_t SERVER_PORT = 40000;
 
